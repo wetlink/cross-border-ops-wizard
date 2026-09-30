@@ -2,7 +2,7 @@
 
 中文 | [English](README.en.md)
 
-当前版本：`0.5.0`
+当前版本：`0.6.0`
 
 `cross-border-ops-wizard` 是一个面向团队跨境工具运维的访问资产纳管 Skill。它既覆盖新开境外 VPS 的主机、DNS、证书、x-ui / 3x-ui、节点交付与维护，也覆盖新购家宽/静态代理从验真、VPS 链式出站和手机 VLESS 节点，到 AdsPower、RoxyBrowser、BitBrowser 环境关联的完整流程。**腾讯云 Lighthouse 作为 VPS 内置 profile**，其他云和代理服务商按同一套资产模型纳管。
 
@@ -30,7 +30,7 @@
 - DNS 与证书检查。
 - x-ui 管理界面部署流程、面板入口和账号交接边界。
 - 一键起节点引擎 `scripts/node-wizard.sh`（deploy/verify/panel-open/panel-close/links/rollback）。
-- 3x-ui 3.x 链式出口工具 `scripts/xui_chain_egress.py`（dry-run、备份、幂等写入、强制重启、运行配置读回和端到端出口验收）。
+- 旧版 x-ui / 新版 3x-ui 链式出口工具 `scripts/xui_chain_egress.py`（接口识别、VPS 上游预检、备份、专属路由、强制重启、配置读回和 VLESS 出口验收）。
 - 公开/私有端口边界设计。
 - 服务状态、日志、网络连通性和团队可用性验收。
 - 本地 runbook 和敏感交付手册骨架生成。
@@ -67,12 +67,43 @@
         └── SKILL.md
 ```
 
+## VPS 链式代理 → VLESS 链接
+
+适合已有 **SSH + x-ui/3x-ui + VLESS TCP/Reality 入站**，另外买了支持认证的 SOCKS5 或 HTTP 代理的用户：
+
+```text
+设备 → 自有 VPS 的 VLESS/Reality 入站 → 独立用户路由 → 购买的代理出口
+```
+
+这不是修改所有用户的默认出口，也不会自动切换 Clash、Claude 或浏览器。
+将面板凭据和代理凭据放在仓库之外的 `0600` env 文件，字段见
+[链式部署指南](references/chain-egress.md)。预览：
+
+```bash
+python3 scripts/xui_chain_egress.py chain-upsert \
+  --xui-env ~/.config/vps-ops/node-x-ui.env --ssh-alias managed-node \
+  --proxy-env ~/.config/vps-ops/proxy-chains.env --proxy-prefix IPNEW \
+  --inbound-id 1 --client-email phone-new --outbound-tag phone_exit_new \
+  --public-host node.example.test --expected-exit-ip 203.0.113.20 \
+  --output ~/.config/vps-ops/phone-new-delivery.json --dry-run
+```
+
+示例域名和 IP 是占位值。核对首跳、入站和重启窗口后，去掉 `--dry-run` 执行。
+成功才输出 `.json.vless.txt` 私密链接文件；JSON 中 `verified: true` 表示此次出口验收通过。
+旧版用 API 注册客户端，再从面板持久化数据导出链接，不裸写数据库、不重新生成 Reality 密钥。
+用 `--regression-manifest` 在变更前后验证现有 AI 等重要出口，失败即停止。
+
+兼容范围：旧版 2.x 风格的 `/panel/xray/`、`inbounds/addClient` 与新版 3.x 客户端接口。
+只在只读探测返回 404 时切换接口，不把鉴权失败当成版本问题。其他分支、传输协议需单独适配。
+发布测试使用脱敏的双版本 HTTP 模拟服务，不会为测试修改生产 VPS。
+
 ## 快速检查
 
 ```bash
 python3 scripts/validate_skill_package.py
 python3 scripts/render_node_materials.py --help
 python3 scripts/xui_chain_egress.py --help
+python3 scripts/check_public_safety.py
 tests/run.sh
 ```
 

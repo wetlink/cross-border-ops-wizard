@@ -56,7 +56,7 @@ cp "$SRC_SKILL_MD" "$BUNDLE/SKILL.md"
 for sub in references scripts; do
   [ -d "$ROOT_DIR/$sub" ] || continue
   # exclude .DS_Store and packaged zips
-  (cd "$ROOT_DIR" && find "$sub" -type f ! -name '.DS_Store' ! -name '*.zip' -print0) \
+  (cd "$ROOT_DIR" && find "$sub" -type f ! -path '*/__pycache__/*' ! -name '*.pyc' ! -name '*.pyo' ! -name '.DS_Store' ! -name '*.zip' -print0) \
     | while IFS= read -r -d '' f; do
         mkdir -p "$BUNDLE/$(dirname "$f")"
         cp "$ROOT_DIR/$f" "$BUNDLE/$f"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Persist a per-client proxy egress in 3x-ui 3.x and render local sidecars.
+"""Persist a per-client proxy egress in legacy x-ui / 3x-ui and render sidecars.
 
 Credentials are loaded from private env files. The tool never prints proxy
 credentials or VLESS URLs; sensitive delivery material is written mode 0600.
@@ -13,7 +13,9 @@ import http.cookiejar
 import json
 import os
 import re
+import secrets
 import shlex
+import shutil
 import socket
 import ssl
 import subprocess
@@ -23,6 +25,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -62,7 +65,7 @@ def unwrap_json(value: Any) -> Any:
 
 def check_response(response: dict[str, Any], action: str) -> dict[str, Any]:
     if not response.get("success"):
-        raise OpsError("%s failed: %s" % (action, response.get("msg", "unknown error")))
+        raise OpsError("%s failed (panel message withheld; inspect privately)" % action)
     return response
 
 
@@ -109,6 +112,7 @@ class XUIClient:
         self.username = username
         self.password = password
         self.csrf_token = ""
+        self.api_generation = "auto"
         context = ssl._create_unverified_context() if insecure else ssl.create_default_context()
         self.cookies = http.cookiejar.CookieJar()
         self.opener = urllib.request.build_opener(
@@ -150,13 +154,34 @@ class XUIClient:
         check_response(response, "login")
 
     def list_clients(self) -> list[dict[str, Any]]:
+        if getattr(self, "api_generation", "auto") == "legacy":
+            rows = []
+            for inbound in self.inbounds():
+                for item in unwrap_json(inbound.get("settings", {})).get("clients", []):
+                    rows.append({"email": item.get("email"), "inboundIds": [inbound["id"]], "client": item})
+            return rows
         return check_response(self.get("/panel/api/clients/list"), "list clients").get("obj", [])
 
+    def inbounds(self) -> list[dict[str, Any]]:
+        return check_response(self.get("/panel/api/inbounds/list"), "list inbounds").get("obj", [])
+
     def get_client(self, email: str) -> dict[str, Any]:
+        if getattr(self, "api_generation", "auto") == "legacy":
+            rows = [row for row in self.list_clients() if row.get("email") == email]
+            if len(rows) != 1:
+                raise OpsError("legacy client absent or email ambiguous across inbounds")
+            return rows[0]
         path = "/panel/api/clients/get/" + urllib.parse.quote(email, safe="")
         return check_response(self.get(path), "get client").get("obj", {})
 
     def create_client(self, email: str, inbound_id: int) -> dict[str, Any]:
+        if getattr(self, "api_generation", "auto") == "legacy":
+            item = {"id": str(uuid.uuid4()), "email": email, "enable": True,
+                    "flow": "xtls-rprx-vision", "limitIp": 0, "totalGB": 0,
+                    "expiryTime": 0, "tgId": "", "subId": secrets.token_hex(12), "reset": 0}
+            return check_response(self.post_form("/panel/api/inbounds/addClient", {
+                "id": inbound_id, "settings": json.dumps({"clients": [item]}),
+            }), "create legacy client")
         return check_response(self.post_json("/panel/api/clients/add", {
             "client": {
                 "email": email,
@@ -171,15 +196,28 @@ class XUIClient:
         }), "create client")
 
     def attach_client(self, email: str, inbound_id: int) -> dict[str, Any]:
+        if getattr(self, "api_generation", "auto") == "legacy":
+            raise OpsError("legacy email belongs to another inbound; choose a new email")
         path = "/panel/api/clients/%s/attach" % urllib.parse.quote(email, safe="")
         return check_response(self.post_json(path, {"inboundIds": [inbound_id]}), "attach client")
 
     def xray_envelope(self) -> dict[str, Any]:
-        response = check_response(self.post_form("/panel/api/xray/", {}), "get Xray template")
+        generation = getattr(self, "api_generation", "auto")
+        path = "/panel/xray/" if generation == "legacy" else "/panel/api/xray/"
+        try:
+            response = self.post_form(path, {})
+            self.api_generation = "legacy" if generation == "legacy" else "modern"
+        except urllib.error.HTTPError as error:
+            if generation != "auto" or error.code != 404:
+                raise
+            response = self.post_form("/panel/xray/", {})
+            self.api_generation = "legacy"
+        check_response(response, "get Xray template")
         return unwrap_json(response.get("obj"))
 
     def update_xray_template(self, template: dict[str, Any], test_url: str = DEFAULT_TEST_URL) -> dict[str, Any]:
-        return check_response(self.post_form("/panel/api/xray/update", {
+        path = "/panel/xray/update" if getattr(self, "api_generation", "auto") == "legacy" else "/panel/api/xray/update"
+        return check_response(self.post_form(path, {
             "xraySetting": json.dumps(template, separators=(",", ":")),
             "outboundTestUrl": test_url or DEFAULT_TEST_URL,
         }), "update Xray template")
@@ -188,8 +226,36 @@ class XUIClient:
         return check_response(self.post_form("/panel/api/server/restartXrayService", {}), "force restart Xray")
 
     def client_links(self, email: str) -> list[str]:
+        if getattr(self, "api_generation", "auto") == "legacy":
+            row = self.get_client(email)
+            inbound = next(b for b in self.inbounds() if b["id"] == row["inboundIds"][0])
+            return [legacy_vless_link(inbound, row["client"])]
         path = "/panel/api/clients/links/" + urllib.parse.quote(email, safe="")
         return check_response(self.get(path), "get client links").get("obj", [])
+
+
+def validate_inbound(inbound: dict[str, Any]) -> dict[str, Any]:
+    stream = unwrap_json(inbound.get("streamSettings", {}))
+    if (not inbound.get("enable") or inbound.get("protocol") != "vless"
+            or stream.get("network") not in ("tcp", "raw") or stream.get("security") != "reality"):
+        raise OpsError("chain-upsert supports enabled VLESS TCP/Reality inbounds only")
+    return stream
+
+
+def legacy_vless_link(inbound: dict[str, Any], client: dict[str, Any]) -> str:
+    reality = validate_inbound(inbound)["realitySettings"]
+    extra = reality.get("settings", {})
+    names = reality.get("serverNames", [])
+    sni = extra.get("serverName") or (names[0] if names else "")
+    if not sni or not extra.get("publicKey") or not reality.get("shortIds") or not client.get("id"):
+        raise OpsError("legacy inbound is missing public Reality parameters; do not regenerate keys")
+    query = {"type": "tcp", "encryption": "none", "security": "reality",
+             "flow": client.get("flow", ""), "sni": sni,
+             "fp": extra.get("fingerprint") or "chrome", "pbk": extra["publicKey"],
+             "sid": reality["shortIds"][0], "spx": extra.get("spiderX") or "/"}
+    return "vless://%s@localhost:%d?%s#%s" % (
+        urllib.parse.quote(client["id"], safe=""), inbound["port"], urllib.parse.urlencode(query),
+        urllib.parse.quote(client["email"], safe=""))
 
 
 def proxy_from_env(env: dict[str, str], prefix: str) -> dict[str, Any]:
@@ -227,28 +293,55 @@ def build_proxy_outbound(proxy: dict[str, Any], outbound_tag: str) -> dict[str, 
 
 def merge_chain_egress(template: dict[str, Any], proxy: dict[str, Any],
                        client_email: str, outbound_tag: str) -> dict[str, Any]:
+    if outbound_tag.lower() in ("direct", "blocked", "block", "reject", "api"):
+        raise OpsError("reserved outbound tag; choose a dedicated tag")
     merged = copy.deepcopy(template)
     outbounds = merged.setdefault("outbounds", [])
-    merged["outbounds"] = [item for item in outbounds if item.get("tag") != outbound_tag]
-    merged["outbounds"].append(build_proxy_outbound(proxy, outbound_tag))
-
     routing = merged.setdefault("routing", {})
     rules = routing.setdefault("rules", [])
-    routing["rules"] = [
-        rule for rule in rules
-        if rule.get("outboundTag") != outbound_tag
-        and client_email not in (rule.get("user") or [])
-    ]
-    routing["rules"].append({
-        "type": "field",
-        "user": [client_email],
-        "outboundTag": outbound_tag,
-    })
+    owned = {"type": "field", "user": [client_email], "outboundTag": outbound_tag}
+    matches = [r for r in rules if r.get("outboundTag") == outbound_tag or client_email in (r.get("user") or [])]
+    if any(r != owned for r in matches) or len(matches) > 1:
+        raise OpsError("shared, constrained or conflicting route; refusing to change it")
+    indices = [i for i, o in enumerate(outbounds) if o.get("tag") == outbound_tag]
+    if len(indices) > 1 or (indices and (indices[0] == 0 or not matches)):
+        raise OpsError("outbound ownership is not exclusive or is the default outbound")
+    for outbound in outbounds:
+        if (outbound.get("proxySettings", {}).get("tag") == outbound_tag
+                or outbound.get("streamSettings", {}).get("sockopt", {}).get("dialerProxy") == outbound_tag):
+            raise OpsError("outbound is shared by another chained proxy")
+    for balancer in routing.get("balancers", []):
+        if any(outbound_tag.startswith(prefix) for prefix in balancer.get("selector", [])):
+            raise OpsError("outbound is selected by a balancer")
+    outbound = build_proxy_outbound(proxy, outbound_tag)
+    if indices:
+        outbounds[indices[0]] = outbound
+    else:
+        if not outbounds:
+            raise OpsError("template has no default outbound; refusing to make the new exit global")
+        outbounds.append(outbound)
+    kept = [r for r in rules if r != owned]
+    blocked = {o.get("tag") for o in outbounds if o.get("protocol") == "blackhole"} | {"blocked", "block", "reject"}
+    # Keep the leading API/security boundary, then beat domain and catch-all rules.
+    index = 0
+    for rule in kept:
+        boundary = ((rule.get("inboundTag") == ["api"] and rule.get("outboundTag") == "api")
+                    or (rule.get("outboundTag") in blocked and not rule.get("user")))
+        if not boundary:
+            break
+        index += 1
+    if any(r.get('outboundTag') in blocked and not r.get('user') for r in kept[index:]):
+        raise OpsError('security rules are not a leading block; review ordering before merging')
+    kept.insert(index, owned)
+    routing["rules"] = kept
     return merged
 
 
 def ensure_client(client: XUIClient, email: str, inbound_id: int) -> dict[str, Any]:
-    rows = {row.get("email"): row for row in client.list_clients()}
+    all_rows = client.list_clients()
+    if sum(row.get("email") == email for row in all_rows) > 1:
+        raise OpsError("client email is ambiguous")
+    rows = {row.get("email"): row for row in all_rows}
     row = rows.get(email)
     if row is None:
         client.create_client(email, inbound_id)
@@ -257,6 +350,8 @@ def ensure_client(client: XUIClient, email: str, inbound_id: int) -> dict[str, A
     result = client.get_client(email)
     if inbound_id not in (result.get("inboundIds") or []):
         raise OpsError("client was not attached to inbound after write")
+    if result.get("client", result).get("enable") is False:
+        raise OpsError("client is disabled; do not silently re-enable it")
     return result
 
 
@@ -378,44 +473,87 @@ def launchd_plist(label: str, xray_bin: str, config_path: str) -> str:
 """.format(label=esc(label), xray=esc(xray_bin), config=esc(config_path))
 
 
+def remote_json(env: dict[str, str], script: str, data: Any) -> Any:
+    alias = env.get("XUI_SSH_ALIAS", "")
+    if not alias:
+        raise OpsError("SSH alias required")
+    prefix = "sudo -n " if env.get("XUI_SUDO", "0").lower() in ("1", "true", "yes") else ""
+    command = prefix + "python3 -c " + shlex.quote(script)
+    result = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", alias, command],
+        input=json.dumps(data), text=True, capture_output=True, timeout=90,
+    )
+    if result.returncode:
+        raise OpsError("remote check failed (output withheld to protect configuration)")
+    return json.loads(result.stdout)
+
+
 def backup_database(env: dict[str, str]) -> str:
     alias = env.get("XUI_SSH_ALIAS", "")
     if not alias:
         return "skipped_no_ssh_alias"
     db_path = env.get("XUI_DB_PATH", DEFAULT_DB_PATH)
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    target = "/root/x-ui-backups/x-ui-before-chain-%s.db" % stamp
-    command = "install -d -m 700 /root/x-ui-backups && cp %s %s && chmod 600 %s" % (
-        shlex.quote(db_path), shlex.quote(target), shlex.quote(target))
-    subprocess.run(["ssh", "-o", "BatchMode=yes", alias, command], check=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3)
+    target = env.get("XUI_BACKUP_DIR", "/root/x-ui-backups") + "/chain-" + stamp
+    remote_json(env, '''import json,sys,os,sqlite3,shutil
+d=json.load(sys.stdin); os.umask(0o077); os.makedirs(d['target'],mode=0o700,exist_ok=False)
+source=sqlite3.connect('file:'+d['db']+'?mode=ro',uri=True)
+dest=sqlite3.connect(d['target']+'/x-ui.db'); source.backup(dest)
+assert dest.execute('PRAGMA quick_check').fetchone()[0]=='ok'
+dest.close(); source.close()
+shutil.copyfile(d['runtime'],d['target']+'/config.json')
+for name in ('x-ui.db','config.json'): os.chmod(d['target']+'/'+name,0o600)
+print(json.dumps({'ok':True}))
+''', {"db": db_path, "runtime": env.get("XUI_RUNTIME_CONFIG", DEFAULT_RUNTIME_CONFIG), "target": target})
     return target
 
 
-def verify_runtime_via_ssh(env: dict[str, str], email: str, outbound_tag: str) -> bool:
-    alias = env.get("XUI_SSH_ALIAS", "")
-    if not alias:
+def read_runtime(env: dict[str, str]) -> dict[str, Any]:
+    return remote_json(env, "import json,sys; print(open(json.load(sys.stdin)['path']).read())",
+                       {"path": env.get("XUI_RUNTIME_CONFIG", DEFAULT_RUNTIME_CONFIG)})
+
+
+def without_chain(config: dict[str, Any], email: str, tag: str) -> dict[str, Any]:
+    result = copy.deepcopy(config)
+    result['outbounds'] = [o for o in result.get('outbounds', []) if o.get('tag') != tag]
+    result.setdefault('routing', {})['rules'] = [r for r in result.get('routing', {}).get('rules', [])
+                                                 if r.get('outboundTag') != tag]
+    for inbound in result.get('inbounds', []):
+        settings = unwrap_json(inbound.get('settings', {}))
+        if 'clients' in settings:
+            settings['clients'] = [c for c in settings['clients'] if c.get('email') != email]
+            inbound['settings'] = settings
+    return result
+
+
+def verify_runtime_via_ssh(env: dict[str, str], email: str, outbound_tag: str,
+                           expected: dict[str, Any], baseline: dict[str, Any], identity: str) -> bool:
+    if not env.get("XUI_SSH_ALIAS"):
         return False
-    runtime_path = env.get("XUI_RUNTIME_CONFIG", DEFAULT_RUNTIME_CONFIG)
-    script = r'''import json,sys
-d=json.load(open(sys.argv[1]))
-email=sys.argv[2]; tag=sys.argv[3]
-out={item.get("tag") for item in d.get("outbounds",[])}
-routes={item.get("outboundTag") for item in d.get("routing",{}).get("rules",[])}
-users=set()
-for inbound in d.get("inbounds",[]):
-    settings=inbound.get("settings",{})
-    if isinstance(settings,str):
-        try: settings=json.loads(settings)
-        except ValueError: settings={}
-    users.update(item.get("email") for item in settings.get("clients",[]))
-print(json.dumps({"ok": tag in out and tag in routes and email in users}))
-'''
-    remote = "python3 - %s %s %s" % tuple(map(shlex.quote, (runtime_path, email, outbound_tag)))
-    result = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", alias, remote],
-        input=script, text=True, capture_output=True, check=True,
-    )
-    return bool(json.loads(result.stdout).get("ok"))
+    runtime = read_runtime(env)
+    actual = [o for o in runtime.get('outbounds', []) if o.get('tag') == outbound_tag]
+    wanted = [o for o in expected.get('outbounds', []) if o.get('tag') == outbound_tag]
+    users = [c for b in runtime.get('inbounds', []) for c in unwrap_json(b.get('settings', {})).get('clients', [])]
+    return (actual == wanted and len(actual) == 1
+            and runtime.get('routing') == expected.get('routing')
+            and any(c.get('email') == email and c.get('id') == identity for c in users)
+            and without_chain(runtime, email, outbound_tag) == without_chain(baseline, email, outbound_tag))
+
+
+def verify_upstream(env: dict[str, str], proxy: dict[str, Any], expected_ip: str) -> None:
+    result = remote_json(env, '''import json,sys,subprocess
+d=json.load(sys.stdin); p=d['proxy']; scheme='socks5h' if p['protocol'] in ('socks','socks5') else 'http'
+cfg='proxy = '+json.dumps(scheme+'://'+p['host']+':'+str(p['port']))+'\\n'
+cfg+='proxy-user = '+json.dumps(p['username']+':'+p['password'])+'\\n'
+ok=[]
+for url in ('https://api.ipify.org','https://checkip.amazonaws.com'):
+ r=subprocess.run(['curl','--config','-','--noproxy','','-4fsS','--connect-timeout','8','--max-time','20',url],
+                  input=cfg,text=True,capture_output=True,timeout=25)
+ ok.append(r.returncode==0 and r.stdout.strip()==d['expected'])
+print(json.dumps({'ok':all(ok)}))
+''', {'proxy': proxy, 'expected': expected_ip})
+    if not result.get('ok'):
+        raise OpsError('upstream authentication or expected exit check failed from VPS; no changes made')
 
 
 def verify_exit(link: str, expected_ip: str, xray_bin: str, curl_bin: str) -> str:
@@ -439,13 +577,15 @@ def verify_exit(link: str, expected_ip: str, xray_bin: str, curl_bin: str) -> st
                         break
                 except OSError:
                     time.sleep(0.2)
+            else:
+                raise OpsError("temporary Xray sidecar did not become ready")
             output = subprocess.check_output([
-                curl_bin, "--silent", "--show-error", "--max-time", "30",
+                curl_bin, "--noproxy", "", "--ipv4", "--fail", "--silent", "--show-error", "--max-time", "30",
                 "--proxy", "socks5h://127.0.0.1:%d" % port,
                 "https://api.ipify.org",
             ], text=True).strip()
             if output != expected_ip:
-                raise OpsError("end-to-end exit mismatch: expected %s, got %s" % (expected_ip, output))
+                raise OpsError("end-to-end exit mismatch; delivery is not accepted")
             return output
         finally:
             process.terminate()
@@ -453,6 +593,7 @@ def verify_exit(link: str, expected_ip: str, xray_bin: str, curl_bin: str) -> st
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 process.kill()
+                process.wait(timeout=5)
 
 
 @contextlib.contextmanager
@@ -460,6 +601,7 @@ def connected_client(env: dict[str, str]) -> Iterator[XUIClient]:
     env = dict(env)
     env.setdefault("XUI_USER", env.get("XUI_ADMIN_USER", ""))
     env.setdefault("XUI_PASS", env.get("XUI_ADMIN_PASS", ""))
+    env.setdefault("XUI_PORT", env.get("XUI_WEB_PORT", ""))
     required(env, "XUI_USER", "XUI_PASS")
     insecure = env.get("XUI_INSECURE", "0").lower() in ("1", "true", "yes")
     if env.get("XUI_BASE_URL"):
@@ -486,19 +628,60 @@ def connected_client(env: dict[str, str]) -> Iterator[XUIClient]:
         yield client
 
 
+def verify_regressions(args: argparse.Namespace) -> list[str]:
+    if not args.regression_manifest:
+        return []
+    path = Path(args.regression_manifest).expanduser()
+    results = []
+    for item in json.loads(path.read_text(encoding="utf-8")):
+        link_path = Path(item['link_file']).expanduser()
+        if not link_path.is_absolute():
+            link_path = path.parent / link_path
+        link = first_vless_link(link_path.read_text(encoding="utf-8"))
+        verify_exit(link, item['expected_exit_ip'], args.xray_bin, args.curl_bin)
+        results.append(item['name'])
+    return results
+
+
 def command_chain_upsert(args: argparse.Namespace) -> int:
     xui_env = load_env(args.xui_env)
     if args.ssh_alias:
         xui_env["XUI_SSH_ALIAS"] = args.ssh_alias
+    if not args.dry_run:
+        if not args.expected_exit_ip:
+            raise OpsError("--expected-exit-ip is required for deployment")
+        if not xui_env.get("XUI_SSH_ALIAS") and not args.allow_api_only:
+            raise OpsError("SSH required for backup, upstream preflight and runtime verification")
+        if not shutil.which(args.xray_bin) or not shutil.which(args.curl_bin):
+            raise OpsError('local Xray and curl are required for acceptance; install them before deployment')
+    if args.public_host and (args.public_host.strip('[]').lower() in ('localhost', '127.0.0.1', '::1', '0.0.0.0', '::')
+                            or re.search(r'[/\s?#@]', args.public_host)):
+        raise OpsError('--public-host must be the public entry hostname or IP, without a scheme or path')
     proxy = proxy_from_env(load_env(args.proxy_env), args.proxy_prefix)
     with connected_client(xui_env) as client:
         envelope = client.xray_envelope()
         template = unwrap_json(envelope["xraySetting"])
+        inbounds = client.inbounds()
+        inbound = next((b for b in inbounds if b['id'] == args.inbound_id), None)
+        if not inbound:
+            raise OpsError("selected inbound does not exist")
+        validate_inbound(inbound)
+        rows = [r for r in client.list_clients() if r.get('email') == args.client_email]
+        if len(rows) > 1 or (rows and set(rows[0].get('inboundIds', [])) != {args.inbound_id}):
+            raise OpsError("client email is shared or belongs to another inbound; choose a new one")
+        if rows and rows[0].get('client', rows[0]).get('enable') is False:
+            raise OpsError("existing client is disabled; no changes made")
+        if client.api_generation == 'legacy':
+            # Reject unsupported export settings before making any server writes.
+            legacy_vless_link(inbound, {'id': 'preflight', 'email': args.client_email})
+            if not args.public_host:
+                raise OpsError("legacy export requires --public-host (the VPS entry, not the proxy exit)")
         merged = merge_chain_egress(template, proxy, args.client_email, args.outbound_tag)
         before = template_state(template, args.client_email, args.outbound_tag)
         if args.dry_run:
             print(json.dumps({
                 "dry_run": True,
+                "api_generation": client.api_generation,
                 "client_email": args.client_email,
                 "inbound_id": args.inbound_id,
                 "outbound_tag": args.outbound_tag,
@@ -507,9 +690,21 @@ def command_chain_upsert(args: argparse.Namespace) -> int:
             }, indent=2))
             return 0
 
+        baseline = read_runtime(xui_env) if xui_env.get('XUI_SSH_ALIAS') else {}
+        if baseline:
+            verify_upstream(xui_env, proxy, args.expected_exit_ip)
+        verify_regressions(args)
         backup = backup_database(xui_env)
-        client_info = ensure_client(client, args.client_email, args.inbound_id)
+        write_sensitive(str(Path(args.output).expanduser()) + '.before.json', {
+            'template': template, 'inbounds': inbounds, 'runtime': baseline, 'backup': backup,
+            'client_email': args.client_email, 'outbound_tag': args.outbound_tag,
+            'client_existed': bool(rows), 'api_generation': client.api_generation,
+        })
+        if unwrap_json(client.xray_envelope()['xraySetting']) != template:
+            raise OpsError('template changed during preflight; stopped before writes')
+        # Persist the user route first so a new client never inherits the default exit.
         client.update_xray_template(merged, envelope.get("outboundTestUrl", DEFAULT_TEST_URL))
+        client_info = ensure_client(client, args.client_email, args.inbound_id)
         client.force_restart_xray()
         time.sleep(args.restart_wait)
 
@@ -517,12 +712,9 @@ def command_chain_upsert(args: argparse.Namespace) -> int:
         final_template = unwrap_json(final_envelope["xraySetting"])
         state = template_state(final_template, args.client_email, args.outbound_tag)
         final_client = client.get_client(args.client_email)
-        if not all(state.values()) or args.inbound_id not in (final_client.get("inboundIds") or []):
+        if (final_template != merged or not all(state.values())
+                or args.inbound_id not in (final_client.get("inboundIds") or [])):
             raise OpsError("persisted template/client readback failed after force restart")
-
-        runtime_ok = verify_runtime_via_ssh(xui_env, args.client_email, args.outbound_tag)
-        if not runtime_ok and not args.allow_api_only:
-            raise OpsError("runtime config readback unavailable or failed; set XUI_SSH_ALIAS or use --allow-api-only")
 
         links = client.client_links(args.client_email)
         if args.public_host:
@@ -531,24 +723,32 @@ def command_chain_upsert(args: argparse.Namespace) -> int:
             raise OpsError("3x-ui returned no client links")
         if any(vless_link_uses_loopback(link) for link in links):
             raise OpsError("generated VLESS link uses loopback; pass --public-host")
+        vless = next((link for link in links if link.startswith('vless://')), '')
+        if not vless:
+            raise OpsError('export returned no VLESS link')
+        identity = urllib.parse.unquote(urllib.parse.urlsplit(vless).username or '')
+        runtime_ok = verify_runtime_via_ssh(xui_env, args.client_email, args.outbound_tag, merged, baseline, identity)
+        if not runtime_ok and xui_env.get('XUI_SSH_ALIAS'):
+            raise OpsError('runtime/client identity or unrelated configuration changed; stop and inspect private backup')
         delivery = {
             "client_email": args.client_email,
             "inbound_id": args.inbound_id,
             "outbound_tag": args.outbound_tag,
             "client": client_info.get("client", final_client.get("client", {})),
             "links": links,
+            "verified": False,
         }
         write_sensitive(args.output, delivery)
-
-        exit_result = "not_requested"
-        if args.expected_exit_ip:
-            vless = next((link for link in links if link.startswith("vless://")), "")
-            if not vless:
-                raise OpsError("end-to-end verification requires a VLESS link")
-            exit_result = verify_exit(vless, args.expected_exit_ip, args.xray_bin, args.curl_bin)
+        exit_result = verify_exit(vless, args.expected_exit_ip, args.xray_bin, args.curl_bin)
+        regressions = verify_regressions(args)
+        delivery.update(verified=True, observed_exit=exit_result, regression_passed=regressions,
+                        runtime_verified=runtime_ok, api_generation=client.api_generation, backup=backup)
+        write_sensitive(args.output, delivery)
+        write_sensitive(str(Path(args.output).expanduser()) + '.vless.txt', vless + '\n')
 
         print(json.dumps({
             "ok": True,
+            "api_generation": client.api_generation,
             "client_email": args.client_email,
             "outbound_tag": args.outbound_tag,
             "backup": backup,
@@ -557,6 +757,7 @@ def command_chain_upsert(args: argparse.Namespace) -> int:
             "link_count": len(links),
             "delivery_file": str(Path(args.output).expanduser()),
             "end_to_end_exit": exit_result,
+            "regression_passed": regressions,
         }, indent=2))
     return 0
 
@@ -569,6 +770,7 @@ def command_summary(args: argparse.Namespace) -> int:
         envelope = client.xray_envelope()
         template = unwrap_json(envelope["xraySetting"])
         print(json.dumps({
+            "api_generation": client.api_generation,
             "clients": len(client.list_clients()),
             "outbound_tags": [item.get("tag") for item in template.get("outbounds", [])],
             "routing_rules": len(template.get("routing", {}).get("rules", [])),
@@ -611,7 +813,8 @@ def build_parser() -> argparse.ArgumentParser:
     chain.add_argument("--outbound-tag", required=True)
     chain.add_argument("--output", required=True, help="Mode-0600 JSON delivery path")
     chain.add_argument("--public-host", default="", help="Rewrite generated VLESS links to this public host")
-    chain.add_argument("--expected-exit-ip", default="")
+    chain.add_argument("--expected-exit-ip", default="", help="Required for deployment, optional for dry-run")
+    chain.add_argument("--regression-manifest", default="", help="Private JSON list of existing name/link_file/expected_exit_ip probes")
     chain.add_argument("--xray-bin", default="xray")
     chain.add_argument("--curl-bin", default="curl")
     chain.add_argument("--restart-wait", type=float, default=3.0)
@@ -634,8 +837,9 @@ def main() -> int:
     try:
         args = build_parser().parse_args()
         return args.func(args)
-    except (OpsError, OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as error:
-        print("error: %s" % error, file=sys.stderr)
+    except (OpsError, OSError, ValueError, subprocess.SubprocessError) as error:
+        message = str(error) if isinstance(error, OpsError) else type(error).__name__ + ' (details withheld)'
+        print("error: %s" % message, file=sys.stderr)
         return 1
 
 

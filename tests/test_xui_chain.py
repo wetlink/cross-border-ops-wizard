@@ -4,6 +4,8 @@ import json
 import os
 import tempfile
 import unittest
+import urllib.error
+from unittest import mock
 from pathlib import Path
 
 
@@ -15,6 +17,38 @@ SPEC.loader.exec_module(MODULE)
 
 
 class TemplateMergeTest(unittest.TestCase):
+    def test_user_route_precedes_domains_but_preserves_security_prefix(self):
+        rules = [
+            {"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
+            {"type": "field", "ip": ["geoip:private"], "outboundTag": "blocked"},
+            {"type": "field", "user": ["existing"], "outboundTag": "fixed-exit"},
+            {"type": "field", "domain": ["domain:example.test"], "outboundTag": "fixed-exit"},
+            {"type": "field", "network": "tcp,udp", "outboundTag": "direct"},
+        ]
+        template = {"outbounds": [{"tag": "direct", "protocol": "freedom"}],
+                    "routing": {"rules": rules}}
+        proxy = dict(protocol="socks5", host="proxy.example.test", port=1080,
+                     username="fixture-user", password="fixture-password")
+        result = MODULE.merge_chain_egress(template, proxy, "new-user", "new-exit")
+        updated = result["routing"]["rules"]
+        self.assertEqual(rules[:2], updated[:2])
+        self.assertEqual(["new-user"], updated[2]["user"])
+        self.assertEqual(rules, [r for r in updated if r.get("user") != ["new-user"]])
+        self.assertEqual(rules, template["routing"]["rules"])
+
+    def test_shared_rule_and_reserved_default_are_rejected(self):
+        proxy = dict(protocol="socks5", host="proxy.example.test", port=1080,
+                     username="fixture-user", password="fixture-password")
+        for rule in [
+            {"type": "field", "user": ["new-user", "other"], "outboundTag": "new-exit"},
+            {"type": "field", "domain": ["domain:example.test"], "outboundTag": "new-exit"},
+            {"type": "field", "user": ["new-user"], "outboundTag": "different-exit"},
+        ]:
+            with self.subTest(rule=rule), self.assertRaises(MODULE.OpsError):
+                MODULE.merge_chain_egress({"routing": {"rules": [rule]}}, proxy, "new-user", "new-exit")
+        with self.assertRaises(MODULE.OpsError):
+            MODULE.merge_chain_egress({}, proxy, "new-user", "direct")
+
     def test_merge_is_idempotent_and_preserves_unrelated_config(self):
         template = {
             "outbounds": [
@@ -79,6 +113,113 @@ class XuiApiContractTest(unittest.TestCase):
         self.assertEqual("/panel/api/clients/add", self.calls[0][1])
         self.assertEqual([7], self.calls[0][2]["inboundIds"])
         self.assertEqual("/panel/api/server/restartXrayService", self.calls[1][1])
+
+    def test_read_only_detection_falls_back_only_on_404(self):
+        def post(path, data):
+            self.calls.append(path)
+            if path == "/panel/api/xray/":
+                raise urllib.error.HTTPError("https://panel.example.test", 404, "not found", {}, None)
+            return {"success": True, "obj": json.dumps({"xraySetting": "{}"})}
+        self.client.post_form = post
+        self.assertEqual("{}", self.client.xray_envelope()["xraySetting"])
+        self.assertEqual("legacy", self.client.api_generation)
+        self.client.update_xray_template({})
+        self.assertEqual("/panel/xray/update", self.calls[-1])
+        for code in (401, 403, 500):
+            self.client.api_generation = "auto"
+            with mock.patch.object(self.client, 'post_form', side_effect=urllib.error.HTTPError(
+                    "https://panel.example.test", code, "error", {}, None)) as call:
+                with self.assertRaises(urllib.error.HTTPError):
+                    self.client.xray_envelope()
+                self.assertEqual(1, call.call_count)
+
+    def test_legacy_client_uses_add_client_api_not_database(self):
+        self.client.api_generation = "legacy"
+        self.client.create_client("new-user", 4)
+        kind, path, data = self.calls[0]
+        self.assertEqual(("form", "/panel/api/inbounds/addClient"), (kind, path))
+        new = json.loads(data["settings"])["clients"][0]
+        self.assertEqual("new-user", new["email"])
+        self.assertTrue(new["id"])
+        self.assertTrue(new["subId"])
+        self.assertEqual(4, data["id"])
+
+
+class LegacyLinkTest(unittest.TestCase):
+    def test_export_uses_persisted_client_and_public_reality_settings(self):
+        inbound = {
+            "enable": True, "protocol": "vless", "port": 443,
+            "streamSettings": json.dumps({"network": "tcp", "security": "reality", "realitySettings": {
+                "serverNames": ["www.example.test"], "shortIds": ["abcd"],
+                "privateKey": "never-export-this", "settings": {"publicKey": "public-key", "fingerprint": "chrome"}}}),
+        }
+        client = {"id": "00000000-0000-4000-8000-000000000001", "email": "new-user", "flow": "xtls-rprx-vision"}
+        link = MODULE.legacy_vless_link(inbound, client)
+        self.assertNotIn("never-export-this", link)
+        self.assertIn("pbk=public-key", link)
+        self.assertTrue(MODULE.vless_link_uses_loopback(link))
+        inbound['streamSettings'] = json.dumps({"network": "ws", "security": "none"})
+        with self.assertRaises(MODULE.OpsError):
+            MODULE.legacy_vless_link(inbound, client)
+
+    def test_legacy_clients_are_normalized_without_losing_identity(self):
+        client = MODULE.XUIClient.__new__(MODULE.XUIClient)
+        client.api_generation = "legacy"
+        client.get = mock.Mock(return_value={"success": True, "obj": [
+            {"id": 4, "settings": json.dumps({"clients": [{"id": "fixture-id", "email": "new-user", "enable": True}]})}
+        ]})
+        rows = client.list_clients()
+        self.assertEqual([4], rows[0]['inboundIds'])
+        self.assertEqual('fixture-id', client.get_client('new-user')['client']['id'])
+
+
+class PreflightTest(unittest.TestCase):
+    def test_expected_exit_and_ssh_are_required_before_writes(self):
+        args = MODULE.build_parser().parse_args([
+            'chain-upsert', '--xui-env', 'panel.env', '--proxy-env', 'proxy.env',
+            '--proxy-prefix', 'IPNEW', '--inbound-id', '4', '--client-email', 'new-user',
+            '--outbound-tag', 'new-exit', '--output', 'delivery.json'])
+        with mock.patch.object(MODULE, 'load_env', return_value={}), mock.patch.object(MODULE, 'connected_client') as client:
+            with self.assertRaises(MODULE.OpsError):
+                MODULE.command_chain_upsert(args)
+            args.expected_exit_ip = '203.0.113.20'
+            with self.assertRaises(MODULE.OpsError):
+                MODULE.command_chain_upsert(args)
+            client.assert_not_called()
+
+    def test_upstream_credentials_only_use_stdin(self):
+        proxy = dict(protocol='socks5', host='proxy.example.test', port=1080,
+                     username='fixture-user', password='fixture-sensitive-password')
+        response = mock.Mock(returncode=0, stdout='{"ok":true}')
+        with mock.patch.object(MODULE.subprocess, 'run', return_value=response) as run:
+            MODULE.verify_upstream({'XUI_SSH_ALIAS': 'fixture-node', 'XUI_SUDO': '1'}, proxy, '203.0.113.20')
+        args, kwargs = run.call_args
+        self.assertNotIn(proxy['password'], ' '.join(args[0]))
+        self.assertIn(proxy['password'], kwargs['input'])
+        self.assertIn('sudo -n python3', args[0][-1])
+
+    def test_runtime_checks_exact_route_and_unrelated_state(self):
+        original = {'outbounds': [{'tag': 'direct', 'protocol': 'freedom'}],
+                    'routing': {'rules': []}, 'inbounds': [{'settings': {'clients': []}}]}
+        expected = MODULE.merge_chain_egress(original, dict(protocol='socks5', host='proxy.example.test',
+                     port=1080, username='fixture', password='fixture'), 'new-user', 'new-exit')
+        runtime = json.loads(json.dumps(expected))
+        runtime['inbounds'][0]['settings']['clients'] = [{'id': 'fixture-id', 'email': 'new-user'}]
+        with mock.patch.object(MODULE, 'read_runtime', return_value=runtime):
+            self.assertTrue(MODULE.verify_runtime_via_ssh({'XUI_SSH_ALIAS':'fixture'}, 'new-user', 'new-exit', expected, original, 'fixture-id'))
+            runtime['outbounds'][0]['protocol'] = 'blackhole'
+            self.assertFalse(MODULE.verify_runtime_via_ssh({'XUI_SSH_ALIAS':'fixture'}, 'new-user', 'new-exit', expected, original, 'fixture-id'))
+
+    def test_regression_manifest_probes_private_link(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root/'route.txt').write_text('vless://fixture@node.example.test:443?security=reality')
+            manifest = root/'routes.json'
+            manifest.write_text(json.dumps([{'name':'protected', 'link_file':'route.txt', 'expected_exit_ip':'198.51.100.20'}]))
+            args = mock.Mock(regression_manifest=str(manifest), xray_bin='xray', curl_bin='curl')
+            with mock.patch.object(MODULE, 'verify_exit', return_value='198.51.100.20') as verify:
+                self.assertEqual(['protected'], MODULE.verify_regressions(args))
+                verify.assert_called_once()
 
 
 class SidecarTest(unittest.TestCase):

@@ -63,7 +63,9 @@ GitHub: [wetlink/cross-border-ops-wizard](https://github.com/wetlink/cross-borde
    - 必须按“全局代理库 -> 环境/窗口关联 -> 浏览器内实际出口 -> 全局关联回读”验收，不以控制台代理测试代替最终验收。
 7. 链式出口（按需）：
    - 需要 VPS 第一跳和独立代理出口时，读取 `references/chain-egress.md`。
-   - 优先使用 `scripts/xui_chain_egress.py` 做 dry-run、备份、客户端/出站/路由幂等写入、force restart、运行配置读回和端到端出口验收。
+   - 优先使用 `scripts/xui_chain_egress.py`：只读识别新版/旧版 API，dry-run 后从 VPS 预检上游，再备份、写入专属客户端/出站/路由、force restart、读回并验收完整 VLESS 出口。
+   - 保留用户指定的既有 AI/默认出口；将重要旧链路加入私密 regression manifest。共享规则、已有默认出站或不明客户端归属必须停止，不自动覆盖。
+   - 新用户路由须先于域名规则，原有 API/安全拦截仍在前面。真实部署必须给预期出口；旧版需提供 VPS 的 public-host。交付仅使用验证通过的链接文件。
    - 热加载成功不算完成；必须在强制重启后重新读回并通过实际出口测试。
 8. 文档：
    - 参考 `references/documentation.md` 输出 runbook、敏感交付手册和操作命令。
@@ -91,6 +93,8 @@ python3 scripts/xui_chain_egress.py chain-upsert \
   --inbound-id 1 \
   --client-email phone-new \
   --outbound-tag phone_exit_new \
+  --public-host node.example.test \
+  --expected-exit-ip 203.0.113.20 \
   --output ~/.config/vps-ops/phone-new-delivery.json \
   --dry-run
 ```
@@ -119,7 +123,7 @@ ssh <alias> 'bash /opt/node-wizard/node-wizard.sh panel-close --alias <a>'
 
 # 注意事项
 
-- 不在最终回复中展示私钥、密码、订阅类链接或一次性 token。
+- 默认只交付受限文件，不展示私钥、密码、订阅链接或一次性 token；用户明确要求时可在当前私密交付渠道提供其节点链接，但不放入公开仓、日志或公共文档。
 - 不把真实节点材料提交到公开仓库。
 - 没有用户确认时，不改云防火墙、不重启关键服务、不覆盖现有配置。
 - 如果当前信息不足，先输出待确认清单和只读检查命令。

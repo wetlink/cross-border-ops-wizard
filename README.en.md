@@ -2,7 +2,7 @@
 
 [中文](README.md) | English
 
-Current version: `0.5.0`
+Current version: `0.6.0`
 
 `cross-border-ops-wizard` manages the access-asset lifecycle for teams maintaining cross-border tooling. It covers freshly provisioned overseas VPS hosts, DNS, certificates, x-ui / 3x-ui, node delivery, and maintenance. It also covers newly purchased residential/static proxies from validation through client-specific VPS egress and mobile VLESS delivery to AdsPower, RoxyBrowser, or BitBrowser profile association and in-browser exit verification. **Tencent Cloud Lighthouse ships as a VPS profile**; other clouds and proxy providers use the same asset model.
 
@@ -30,7 +30,7 @@ It focuses on the full path from "provisioned" to "deployed, verified, handed ov
 - DNS and certificate checks.
 - x-ui admin-panel deployment flow, entry model, and account handover boundaries.
 - One-click node engine `scripts/node-wizard.sh` (deploy/verify/panel-open/panel-close/links/rollback).
-- 3x-ui 3.x chained-egress tool `scripts/xui_chain_egress.py` (dry-run, backup, idempotent writes, forced restart, runtime readback, and end-to-end exit verification).
+- Legacy x-ui and modern 3x-ui chained-egress tool `scripts/xui_chain_egress.py` (read-only API detection, VPS upstream preflight, consistent backup, isolated routes, forced restart, runtime readback, and verified VLESS export).
 - Public/private port boundary design.
 - Service, log, network, and team-availability verification.
 - Local runbook and sensitive handover skeleton generation.
@@ -67,12 +67,35 @@ It focuses on the full path from "provisioned" to "deployed, verified, handed ov
         └── SKILL.md
 ```
 
+## VPS Chain to a VLESS Link
+
+Use an existing SSH-managed VPS with an enabled VLESS TCP/Reality inbound and
+an authenticated SOCKS5 or HTTP upstream. The path is:
+
+```text
+device -> your VPS VLESS/Reality inbound -> dedicated user route -> purchased exit
+```
+
+Follow the [private env schemas and deployment guide](references/chain-egress.md).
+Run `chain-upsert --dry-run` first, confirm the target and core restart window,
+then apply with `--expected-exit-ip`. Supply `--public-host` for legacy panels.
+A successful run writes a mode-0600 delivery JSON and `.json.vless.txt`; existing
+Clash selections, AI routes and browser profiles are not switched.
+Use `--regression-manifest` to probe protected exits before and after deployment.
+
+Supported API families are the legacy 2.x-style `/panel/xray/` plus
+`inbounds/addClient`, and modern 3.x client APIs. Detection falls back only on
+a read-only 404, never on authentication errors. Other panel forks/transports
+need separate adaptation. Release tests use synthetic local HTTP fixtures,
+not production VPS writes.
+
 ## Quick Check
 
 ```bash
 python3 scripts/validate_skill_package.py
 python3 scripts/render_node_materials.py --help
 python3 scripts/xui_chain_egress.py --help
+python3 scripts/check_public_safety.py
 tests/run.sh
 ```
 

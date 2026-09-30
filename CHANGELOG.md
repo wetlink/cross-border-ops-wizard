@@ -3,6 +3,34 @@
 All notable changes to `cross-border-ops-wizard` are documented here.
 Versioning follows [SemVer](https://semver.org/). Each release is also a git tag.
 
+## [0.6.0] - 2026-09-30
+
+### Added
+- Legacy x-ui template/client API compatibility, read-only 404 detection and
+  VLESS Reality export from persisted panel parameters without key rotation.
+- VPS-side upstream exit preflight, consistent SQLite backup plus runtime
+  snapshot, non-root SSH support via `XUI_SUDO=1`, and optional protected-route
+  regression manifests.
+- Verified plain VLESS link files, sanitized HTTP workflow fixtures for both
+  API generations, public-material safety checks and a CI test workflow.
+
+### Fixed
+- Place dedicated user rules before domain/catch-all rules while preserving
+  leading API/security rules. Reject shared routes, reserved/default outbounds,
+  ambiguous clients, and outbound dependencies instead of overwriting them.
+- Stop before writes when required verification inputs are missing, the
+  upstream check fails, or the template changes during preflight.
+- Read back exact template/routing/outbound/client identity and compare
+  unrelated runtime state; do not accept tag existence alone.
+- Suppress potentially sensitive panel/transport error payloads and exclude
+  Python bytecode from distributable skill packages.
+
+### Changed
+- Real deployments now require `--expected-exit-ip`; API-only mode must be
+  explicitly selected and records missing SSH verification.
+- This release was tested with offline HTTP fixtures. No production VPS was
+  modified during release validation.
+
 ## [0.5.0] - 2026-07-14
 
 ### Added

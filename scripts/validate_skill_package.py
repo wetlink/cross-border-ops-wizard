@@ -64,7 +64,7 @@ def copy_tree_if_exists(src: Path, dst: Path) -> None:
     for path in src.rglob("*"):
         if not path.is_file():
             continue
-        if path.name == ".DS_Store" or path.suffix == ".zip":
+        if path.name == ".DS_Store" or path.suffix in (".zip", ".pyc", ".pyo") or "__pycache__" in path.parts:
             continue
         rel = path.relative_to(src)
         target = dst / rel
